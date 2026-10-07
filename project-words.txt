@@ -602,6 +602,7 @@ UNLCK
 vaage
 webapis
 WHATWG
+lightup
 
 # banned words
 !timmer
