@@ -247,15 +247,25 @@ jobs:
       - name: Record failed specs
         run: |
           set -euo pipefail
-          # karma-spec-reporter prints each failed spec as "✗ <name>".
-          grep -E '^\s*✗ ' test.log | sed -E 's/^\s*✗ //' | sort -u > "failed-${{ matrix.build }}-${{ matrix.browser }}.txt" || true
-          echo "test.py exit ${{ steps.test.outputs.exit }}; $(wc -l < "failed-${{ matrix.build }}-${{ matrix.browser }}.txt") failed specs"
+          # karma-spec-reporter colours its output; strip the escape codes, then
+          # take each failed spec line ("✗ <name> [<browser>]") without the browser.
+          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' test.log > test-plain.log
+          total="$(grep -E '^TOTAL: ' test-plain.log | tail -1)"
+          [ -n "$total" ] || { echo "::error::no TOTAL line: the test run did not finish"; exit 1; }
+          grep -E '^\s*✗ ' test-plain.log | sed -E 's/^\s*✗ //; s/ \[[^]]*\]$//' | sort -u > "failed-${{ matrix.build }}-${{ matrix.browser }}.txt" || true
+          listed="$(wc -l < "failed-${{ matrix.build }}-${{ matrix.browser }}.txt")"
+          reported="$(printf '%s' "$total" | grep -oE '[0-9]+ FAILED' | grep -oE '[0-9]+' || echo 0)"
+          echo "$total; $listed failed specs listed; test.py exit ${{ steps.test.outputs.exit }}"
+          # The comparison downstream relies on this list, so it must agree with the reporter's count.
+          [ "$listed" = "$reported" ] || { echo "::error::parsed $listed failed specs but the reporter counted $reported"; exit 1; }
+          printf '%s\n' "$total" > "total-${{ matrix.build }}-${{ matrix.browser }}.txt"
       - uses: actions/upload-artifact@v6
         with:
           name: test-${{ matrix.build }}-${{ matrix.browser }}
           path: |
             failed-*.txt
-            test.log
+            total-*.txt
+            test-plain.log
           if-no-files-found: error
 
   compare-tests:
@@ -274,14 +284,15 @@ jobs:
           {
             echo "## Browser tests"
             echo
-            echo "| browser | failed upstream | failed ours | new on ours |"
+            echo "| browser | upstream | ours | new on ours |"
             echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for browser in Chrome Firefox; do
             up="failed-upstream-$browser.txt"; ours="failed-ours-$browser.txt"
             new="$(comm -13 "$up" "$ours")"
             n=0; [ -z "$new" ] || n="$(printf '%s\n' "$new" | wc -l)"
-            echo "| $browser | $(wc -l < "$up") | $(wc -l < "$ours") | $n |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $browser | $(cat "total-upstream-$browser.txt") | $(cat "total-ours-$browser.txt") | $n |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$browser: upstream [$(cat "total-upstream-$browser.txt")] ours [$(cat "total-ours-$browser.txt")] new on ours: $n"
             if [ -n "$new" ]; then
               echo "::error::$browser: specs failing on ours but not upstream:"; printf '%s\n' "$new"; status=1
             fi
