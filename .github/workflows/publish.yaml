@@ -350,10 +350,13 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://npm.pkg.github.com
           scope: "@lightuptw"
+      # Every version here is a semver pre-release, which npm refuses to publish
+      # under the default "latest" dist-tag. Consumers pin exact versions, so the
+      # dist-tag only names the channel.
       - name: Publish to GitHub Packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm publish ours.tgz
+        run: npm publish ours.tgz --tag lightup
       - name: The published version resolves
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
