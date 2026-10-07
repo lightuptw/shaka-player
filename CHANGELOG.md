@@ -1,5 +1,20 @@
 # Changelog
 
+## [5.2.12-lightup.1](https://github.com/lightuptw/shaka-player/compare/v5.2.12...v5.2.12-lightup.1) (2026-10-07)
+
+LightUp build of Shaka Player 5.2.12: the upstream release plus the patches below.
+
+
+### Bug Fixes
+
+* **DASH:** Find the segment when rounding misplaces a fixed-duration lookup ([2c5dcb7](https://github.com/lightuptw/shaka-player/commit/2c5dcb7ad15b452b9cc92475eb54400ff8a767dd))
+
+
+### Build
+
+* Accept dot-separated pre-release identifiers in checkversion ([5edf28c](https://github.com/lightuptw/shaka-player/commit/5edf28c2e84ec3c1fb132ab0c3881a963ecc1c4b))
+* Publish as @lightuptw/shaka-player on GitHub Packages ([8b6e8f4](https://github.com/lightuptw/shaka-player/commit/8b6e8f4c85cc9fb1846532adc99a4427ce184e84))
+
 ## [5.2.12](https://github.com/shaka-project/shaka-player/compare/v5.2.11...v5.2.12) (2026-09-25)
 
 
