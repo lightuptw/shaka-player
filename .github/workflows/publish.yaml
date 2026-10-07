@@ -1,0 +1,377 @@
+# Build, verify and publish a LightUp release of Shaka Player.
+#
+# Started by hand with a tag such as v5.2.12-lightup.1. Every job must pass
+# before the tarball built in "build" is published; the "publish" environment
+# waits for a reviewer's approval first.
+#
+# Gates, in order:
+#   provenance          the tag sits in a straight line on upstream's release tag
+#   reproduce-upstream  upstream's own tag rebuilt here matches upstream's npm tarball
+#   build               our tag built with upstream's gate (checkversion + build/all.py)
+#   test                upstream's browser tests on both builds; no new failures on ours
+#   diff-report         which files in our tarball differ from the upstream rebuild
+#   publish             reviewer approval, then GitHub Packages + a GitHub release
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v5.2.12-lightup.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/shaka-project/shaka-player.git
+  NODE_VERSION: 24
+  JAVA_VERSION: 21
+
+jobs:
+  provenance:
+    name: Provenance
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.derive.outputs.tag }}
+      tag_sha: ${{ steps.derive.outputs.tag_sha }}
+      base: ${{ steps.derive.outputs.base }}
+      base_sha: ${{ steps.derive.outputs.base_sha }}
+      base_version: ${{ steps.derive.outputs.base_version }}
+      version: ${{ steps.derive.outputs.version }}
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Derive the upstream base
+        id: derive
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-lightup\.[0-9]+$ ]] || {
+            echo "::error::tag must look like v5.2.12-lightup.1"; exit 1; }
+          base="${BASH_REMATCH[1]}"
+          tag_sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream "refs/tags/$base:refs/tags/upstream-$base"
+          base_sha="$(git rev-parse "refs/tags/upstream-$base^{commit}")"
+          # The copy of the upstream tag in this fork must be the same commit.
+          [ "$(git rev-parse "refs/tags/$base^{commit}")" = "$base_sha" ] || {
+            echo "::error::this fork's $base is not upstream's $base"; exit 1; }
+          {
+            echo "tag=$TAG"; echo "tag_sha=$tag_sha"; echo "base=$base"
+            echo "base_sha=$base_sha"; echo "base_version=${base#v}"; echo "version=${TAG#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: The tag descends from upstream's release in a straight line
+        env:
+          TAG: ${{ inputs.tag }}
+          BASE: ${{ steps.derive.outputs.base }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "refs/tags/$BASE" "refs/tags/$TAG" || {
+            echo "::error::$TAG does not descend from $BASE"; exit 1; }
+          merges="$(git rev-list --merges "refs/tags/$BASE..refs/tags/$TAG")"
+          [ -z "$merges" ] || { echo "::error::merge commits between $BASE and $TAG: $merges"; exit 1; }
+          git fetch --no-tags origin "refs/heads/lightup/$BASE:refs/remotes/origin/lightup/$BASE"
+          git merge-base --is-ancestor "refs/tags/$TAG" "refs/remotes/origin/lightup/$BASE" || {
+            echo "::error::$TAG is not on branch lightup/$BASE"; exit 1; }
+          {
+            echo "## Patches on top of upstream $BASE"
+            echo
+            echo '```'
+            git log --reverse --format='%h %s' "refs/tags/$BASE..refs/tags/$TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  reproduce-upstream:
+    name: Reproduce upstream ${{ needs.provenance.outputs.base }}
+    needs: provenance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream's tag
+        uses: actions/checkout@v5
+        with:
+          repository: shaka-project/shaka-player
+          ref: refs/tags/${{ needs.provenance.outputs.base }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: The checkout is upstream's commit
+        run: test "$(git rev-parse HEAD)" = "${{ needs.provenance.outputs.base_sha }}"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install
+        run: npm ci
+      - name: Build with upstream's publish gate
+        timeout-minutes: 30
+        run: npm run prepublishOnly
+      - name: Pack
+        run: |
+          set -euo pipefail
+          npm pack
+          mv shaka-player-*.tgz upstream-rebuilt.tgz
+      - name: Download upstream's published tarball
+        env:
+          BASE_VERSION: ${{ needs.provenance.outputs.base_version }}
+        run: |
+          set -euo pipefail
+          npm pack "shaka-player@$BASE_VERSION" --registry https://registry.npmjs.org
+          mv shaka-player-*.tgz upstream-npm.tgz
+      - name: The files we consume are byte-identical to upstream's
+        run: |
+          set -euo pipefail
+          mkdir rebuilt npm
+          tar -xzf upstream-rebuilt.tgz -C rebuilt
+          tar -xzf upstream-npm.tgz -C npm
+          status=0
+          for f in dist/shaka-player.compiled.js dist/shaka-player.ui.js dist/controls.css dist/shaka-player.compiled.externs.js; do
+            if cmp -s "rebuilt/package/$f" "npm/package/$f"; then echo "same  $f"; else echo "::error::differs: $f"; status=1; fi
+          done
+          {
+            echo "## Upstream rebuild vs upstream npm tarball"
+            echo
+            echo "Files differing (build-path dependent files such as source maps and debug builds are expected here):"
+            echo '```'
+            diff -rq rebuilt/package npm/package | sed 's#rebuilt/package/##; s# and npm/package/.*##' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+      - uses: actions/upload-artifact@v6
+        with:
+          name: upstream-tarballs
+          path: |
+            upstream-rebuilt.tgz
+            upstream-npm.tgz
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ inputs.tag }}
+    needs: provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: The checkout is the tag's commit
+        run: test "$(git rev-parse HEAD)" = "${{ needs.provenance.outputs.tag_sha }}"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install
+        run: npm ci
+      - name: Build with upstream's publish gate (checkversion + build/all.py --force)
+        timeout-minutes: 30
+        run: npm run prepublishOnly
+      - name: Pack
+        env:
+          VERSION: ${{ needs.provenance.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm pack
+          test -f "lightuptw-shaka-player-$VERSION.tgz"
+          mv "lightuptw-shaka-player-$VERSION.tgz" ours.tgz
+          tar -tzf ours.tgz | sort > ours-files.txt
+          wc -l ours-files.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ours
+          path: |
+            ours.tgz
+            ours-files.txt
+          if-no-files-found: error
+
+  test:
+    name: Test ${{ matrix.build }} on ${{ matrix.browser }}
+    needs: provenance
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [upstream, ours]
+        browser: [Chrome, Firefox]
+    steps:
+      - name: Install FFmpeg
+        if: matrix.browser == 'Firefox'
+        run: sudo apt -y update && sudo apt -y install ffmpeg
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.build == 'ours' && needs.provenance.outputs.tag_sha || needs.provenance.outputs.base_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install
+        run: npm ci
+      - name: Build (as upstream's test workflow does)
+        timeout-minutes: 20
+        run: python3 build/all.py --only-es5
+      - name: Test
+        id: test
+        timeout-minutes: 40
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          python3 build/test.py --no-build --browsers "${{ matrix.browser }}" \
+            --reporters spec --spec-hide-passed --use-xvfb --running_in_vm 2>&1 | tee test.log
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+      - name: Record failed specs
+        run: |
+          set -euo pipefail
+          # karma-spec-reporter prints each failed spec as "✗ <name>".
+          grep -E '^\s*✗ ' test.log | sed -E 's/^\s*✗ //' | sort -u > "failed-${{ matrix.build }}-${{ matrix.browser }}.txt" || true
+          echo "test.py exit ${{ steps.test.outputs.exit }}; $(wc -l < "failed-${{ matrix.build }}-${{ matrix.browser }}.txt") failed specs"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: test-${{ matrix.build }}-${{ matrix.browser }}
+          path: |
+            failed-*.txt
+            test.log
+          if-no-files-found: error
+
+  compare-tests:
+    name: No new test failures
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: test-*
+          merge-multiple: true
+      - name: Every spec that passes upstream must pass on ours
+        run: |
+          set -euo pipefail
+          status=0
+          {
+            echo "## Browser tests"
+            echo
+            echo "| browser | failed upstream | failed ours | new on ours |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for browser in Chrome Firefox; do
+            up="failed-upstream-$browser.txt"; ours="failed-ours-$browser.txt"
+            new="$(comm -13 "$up" "$ours")"
+            n=0; [ -z "$new" ] || n="$(printf '%s\n' "$new" | wc -l)"
+            echo "| $browser | $(wc -l < "$up") | $(wc -l < "$ours") | $n |" >> "$GITHUB_STEP_SUMMARY"
+            if [ -n "$new" ]; then
+              echo "::error::$browser: specs failing on ours but not upstream:"; printf '%s\n' "$new"; status=1
+            fi
+          done
+          exit $status
+
+  diff-report:
+    name: Tarball diff
+    needs: [build, reproduce-upstream]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ours
+      - uses: actions/download-artifact@v7
+        with:
+          name: upstream-tarballs
+      - name: Files that differ between our tarball and the upstream rebuild
+        run: |
+          set -euo pipefail
+          mkdir ours rebuilt
+          tar -xzf ours.tgz -C ours
+          tar -xzf upstream-rebuilt.tgz -C rebuilt
+          {
+            echo "## Our tarball vs the upstream rebuild"
+            echo
+            echo "$(tar -tzf ours.tgz | wc -l) files in ours, $(tar -tzf upstream-rebuilt.tgz | wc -l) in the rebuild."
+            echo
+            echo '```'
+            diff -rq rebuilt/package ours/package | sed 's#rebuilt/package/##; s# and ours/package/.*##' || true
+            echo '```'
+            echo
+            echo "package.json:"
+            echo '```diff'
+            diff -u rebuilt/package/package.json ours/package/package.json || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish
+    needs: [provenance, compare-tests, diff-report]
+    runs-on: ubuntu-latest
+    environment:
+      name: publish
+      url: https://github.com/lightuptw/shaka-player/pkgs/npm/shaka-player
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ours
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://npm.pkg.github.com
+          scope: "@lightuptw"
+      - name: Publish to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish ours.tgz
+      - name: The published version resolves
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.provenance.outputs.version }}
+        run: test "$(npm view "@lightuptw/shaka-player@$VERSION" version)" = "$VERSION"
+      - name: Checkout the tag for its changelog
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          path: source
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Release notes from the changelog
+        env:
+          VERSION: ${{ needs.provenance.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The changelog section for this version: from its heading to the next "## [" heading.
+          awk -v h="## [$VERSION]" 'index($0, "## [") == 1 {p = index($0, h) == 1} p' source/CHANGELOG.md > notes.md
+          test -s notes.md || { echo "::error::no changelog section for $VERSION"; exit 1; }
+          cat notes.md
+      - name: GitHub release with the tarball
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.provenance.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp ours.tgz "lightuptw-shaka-player-$VERSION.tgz"
+          gh release create "$TAG" "lightuptw-shaka-player-$VERSION.tgz" \
+            --repo "$GITHUB_REPOSITORY" --title "$VERSION" --notes-file notes.md --verify-tag
